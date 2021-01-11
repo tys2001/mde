@@ -31,6 +31,12 @@
             Open
           </b-dropdown-item>
         </b-dropdown-group>
+        <b-dropdown-divider />
+        <b-dropdown-group header="Storage">
+          <b-dropdown-item @click="$refs.storageSettingsModal.show()">
+            Settings
+          </b-dropdown-item>
+        </b-dropdown-group>
       </b-dropdown>
       <b-input type="text" v-model="title" class="title-input" />
       <b-button @click="onClickSave" variant="primary">save</b-button>
@@ -84,18 +90,47 @@
         no-border-collapse
       />
     </b-modal>
+    <b-modal
+      ref="storageSettingsModal"
+      title="Storage Settings"
+      @ok="onStorageSettingModalOk"
+    >
+      <b-form-select v-model="storageType">
+        <option value="browser">Browser (IndexedDB)</option>
+        <option value="dropbox">Dropbox</option>
+      </b-form-select>
+      <b-alert show variant="warning" v-if="storageType === 'browser'"
+        >Note: !</b-alert
+      >
+      <b-card header="Dropbox Auth" v-if="storageType === 'dropbox'">
+        <b-button @click="openAuth" variant="primary">Open Auth Page</b-button>
+        <b-input-group>
+          <b-input
+            type="text"
+            v-model="authCode"
+            placeholder="Enter auth code"
+          />
+          <b-input-group-append
+            ><b-button @click="onAuth" variant="primary"
+              >Auth</b-button
+            ></b-input-group-append
+          >
+        </b-input-group>
+      </b-card>
+    </b-modal>
   </div>
 </template>
 
 <script>
 import marked from "marked";
 import hljs from "highlight.js";
-import Dexie from "dexie";
+import dropbox from "@/dropbox.js";
+import idb from "@/idb.js";
 
 export default {
   data() {
     return {
-      mode: "md",
+      mode: "",
       title: "",
       text: "",
       message: "",
@@ -103,64 +138,71 @@ export default {
       documents: [],
       selectedDocument: null,
       selectedStylesheet: null,
+      authCode: "",
+      storageType: localStorage.storageType || "browser",
     };
   },
-  async created() {
-    this.storage = new Dexie("mdedb");
-    this.storage.version(2).stores({
-      documents: "name",
-      stylesheets: "name",
-      documentContents: "name",
-      stylesheetContents: "name",
-    });
-    this.documents = await this.storage.documents.toArray();
-    this.stylesheets = await this.storage.stylesheets.toArray();
-    marked.setOptions({
-      langPrefix: "hljs language-",
-      highlight: (code, lang) => {
-        return hljs.highlightAuto(code, [lang]).value;
-      },
-    });
-  },
-  mounted() {
-    this.initPreview();
+  async mounted() {
+    this.init();
   },
   methods: {
-    async initPreview() {
-      const stylesheets = await this.storage.stylesheetContents.toArray();
-      const iframeDocument = this.$refs.previewIframe.contentWindow.document;
+    async init() {
+      if (localStorage.storageType === "dropbox") this.storage = dropbox;
+      else this.storage = idb;
+      marked.setOptions({
+        langPrefix: "hljs language-",
+        highlight: (code, lang) => hljs.highlightAuto(code, [lang]).value,
+      });
+      try {
+        this.documents = await this.storage.listDocuments();
+        this.stylesheets = await this.storage.listStylesheets();
+        this.stylesheetContents = await Promise.all(
+          this.stylesheets.map((s) => this.storage.getStylesheet(s.name))
+        );
+      } catch (error) {
+        this.documents = [];
+        this.stylesheets = [];
+        this.stylesheetContents = [];
+        this.$refs.storageSettingsModal.show();
+        alert("You need dropbox auth.");
+      }
+      this.initPreview();
+      this.mode = "md";
+    },
+    initPreview() {
+      const iframe = this.$refs.previewIframe.contentDocument;
+      iframe.head.innerHTML = "";
+      iframe.body.innerHTML = "";
       const meta = document.createElement("meta");
       meta.setAttribute("charset", "utf-8");
-      iframeDocument.head.appendChild(meta);
-      for (let stylesheet of stylesheets) {
+      iframe.head.appendChild(meta);
+      this.titleElement = document.createElement("title");
+      iframe.head.appendChild(this.titleElement);
+      for (let stylesheetContent of this.stylesheetContents) {
         const style = document.createElement("style");
-        style.textContent = stylesheet.text;
-        iframeDocument.head.appendChild(style);
+        style.textContent = stylesheetContent.text;
+        iframe.head.appendChild(style);
       }
       this.previewElement = document.createElement("article");
       this.previewElement.classList.add("content");
-      iframeDocument.body.appendChild(this.previewElement);
+      iframe.body.appendChild(this.previewElement);
     },
     async onOpenDocument(fileName) {
       this.mode = "md";
+      this.initPreview();
       if (fileName) {
-        const document = await this.storage.documentContents.get({
-          name: fileName,
-        });
+        const document = await this.storage.getDocument(fileName);
         this.title = document.name;
         this.text = document.text;
       } else {
         this.title = "new";
         this.text = "";
       }
-      this.initPreview();
     },
     async onOpenStylesheet(fileName) {
       this.mode = "css";
       if (fileName) {
-        const stylesheet = await this.storage.stylesheetContents.get({
-          name: fileName,
-        });
+        const stylesheet = await this.storage.getStylesheet(fileName);
         this.title = stylesheet.name;
         this.text = stylesheet.text;
       } else {
@@ -170,25 +212,14 @@ export default {
     },
     async onClickSave() {
       if (this.mode === "md") {
-        await this.storage.documents.put({
-          name: this.title,
-          datetime: new Date(),
-        });
-        await this.storage.documentContents.put({
-          name: this.title,
-          text: this.text,
-        });
-        this.documents = await this.storage.documents.toArray();
+        await this.storage.saveDocument(this.title, this.text);
+        this.documents = await this.storage.listDocuments();
       } else {
-        await this.storage.stylesheets.put({
-          name: this.title,
-          datetime: new Date(),
-        });
-        await this.storage.stylesheetContents.put({
-          name: this.title,
-          text: this.text,
-        });
-        this.stylesheets = await this.storage.stylesheets.toArray();
+        await this.storage.saveStylesheet(this.title, this.text);
+        this.stylesheets = await this.storage.listStylesheets();
+        this.stylesheetContents = await Promise.all(
+          this.stylesheets.map((s) => this.storage.getStylesheet(s.name))
+        );
       }
       this.message = `Saved ${this.title} at ${new Date().toLocaleString()}`;
     },
@@ -228,17 +259,13 @@ export default {
       const after = this.text.substr(pos, len);
       this.text = before + text + after;
     },
-    onPaste() {
+    async onPaste() {
       const clipBoardData = event.clipboardData.items[0];
       if (clipBoardData.type !== "image/png") return;
       event.preventDefault();
       const file = clipBoardData.getAsFile();
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        var base64 = e.target.result;
-        this.insertText(`![](${base64})`);
-      };
-      reader.readAsDataURL(file);
+      const url = await this.storage.addImage(file);
+      this.insertText(`![](${url})`);
     },
     onScroll() {
       const scrollTrigger = event.target;
@@ -259,18 +286,33 @@ export default {
         }
       }
     },
+    async onAuth() {
+      try {
+        await dropbox.auth(this.authCode);
+        alert("Auth Ok!");
+      } catch (ex) {
+        alert("Auth error!");
+        return;
+      }
+    },
+    openAuth() {
+      dropbox.openAuth();
+    },
+    onStorageSettingModalOk() {
+      if (localStorage.storageType !== this.storageType) {
+        localStorage.storageType = this.storageType;
+      }
+      this.init();
+    },
   },
   watch: {
-    async text() {
+    text() {
       if (this.mode !== "md") return;
-      if (
-        this.$refs.previewIframe.contentWindow.document.body.children[0] !==
-        this.previewElement
-      ) {
-        this.$refs.previewIframe.contentWindow.document.body.innerHTML = "";
-        await this.initPreview();
-      }
       this.previewElement.innerHTML = marked(this.text);
+    },
+    title() {
+      if (this.mode !== "md") return;
+      this.titleElement.textContent = this.title;
     },
   },
 };
@@ -332,7 +374,7 @@ export default {
   resize: none;
   border: none;
   font-size: 14px;
-  white-space: nowrap;
+  word-break: break-all;
 }
 .writer:focus {
   outline: none;
